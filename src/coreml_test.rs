@@ -21,11 +21,14 @@ use std::env;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-// Test configuration
+// Test configuration - OpenELM-450M-Instruct model specifications
 const MODEL_PATH: &str = "OpenELM-450M-Instruct-128-float32.mlmodelc";
 const TOKENIZER_PATH: &str = "tokenizer.json";
 const INPUT_NAME: &str = "input_ids";
 const OUTPUT_NAME: &str = "logits";
+const MAX_SEQUENCE_LENGTH: usize = 128;  // Fixed sequence length
+const VOCAB_SIZE: usize = 32_000;        // LLaMA-2 vocabulary size
+const PAD_TOKEN_ID: u32 = 0;             // Padding token
 
 /// Converts a Candle Tensor to a Core ML MLMultiArray (optimized version)
 fn tensor_to_mlmultiarray(tensor: &Tensor) -> Result<Retained<MLMultiArray>, CandleError> {
@@ -172,6 +175,24 @@ fn extract_logits(
     })
 }
 
+/// Tokenizes text and prepares it for OpenELM model (pad/truncate to 128, convert to f32)
+fn prepare_model_input(text: &str, tokenizer: &Tokenizer, device: &Device) -> Result<Tensor, String> {
+    // 1. Tokenize the text
+    let encoding = tokenizer.encode(text, true).map_err(|e| format!("Tokenization failed: {}", e))?;
+    let mut tokens = encoding.get_ids().to_vec();
+    
+    // 2. Truncate to max length (keep last tokens if too long)
+    tokens.truncate(MAX_SEQUENCE_LENGTH);
+    
+    // 3. Pad to exactly 128 tokens with pad_token_id = 0
+    tokens.resize(MAX_SEQUENCE_LENGTH, PAD_TOKEN_ID);
+    
+    // 4. Convert to f32 and create tensor (1, 128)
+    let token_f32: Vec<f32> = tokens.into_iter().map(|id| id as f32).collect();
+    Tensor::from_vec(token_f32, (1, MAX_SEQUENCE_LENGTH), device)
+        .map_err(|e| format!("Tensor creation failed: {}", e))
+}
+
 /// Finds the token with highest probability
 fn argmax(logits: &[f32]) -> usize {
     let mut max_val = f32::NEG_INFINITY;
@@ -292,7 +313,9 @@ mod tests {
     #[test]
     fn test_feature_provider_creation() {
         let device = Device::Cpu;
-        let tensor = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0], (1, 5), &device).unwrap();
+        // Use correct OpenELM input shape (1, 128) with f32 token IDs
+        let token_ids: Vec<f32> = (0..MAX_SEQUENCE_LENGTH).map(|i| (i % 1000) as f32).collect();
+        let tensor = Tensor::from_vec(token_ids, (1, MAX_SEQUENCE_LENGTH), &device).unwrap();
         let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
         
         let provider = create_feature_provider(INPUT_NAME, &ml_array)
@@ -302,14 +325,19 @@ mod tests {
         // (No need to check null since Retained<> guarantees non-null)
     }
 
-    #[test]
-    #[ignore] // Will be enabled when prediction is implemented
+    #[test] 
+    #[ignore] // Ready for real model - remove ignore to test
     fn test_model_prediction() {
         let model_path = Path::new(MODEL_PATH);
+        let tokenizer_path = Path::new(TOKENIZER_PATH);
+        
         let model = load_model(model_path).expect("Failed to load model");
+        let tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
         
         let device = Device::Cpu;
-        let tensor = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0], (1, 5), &device).unwrap();
+        let prompt = "The quick brown fox";
+        let tensor = prepare_model_input(prompt, &tokenizer, &device)
+            .expect("Failed to prepare model input");
         let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
         let provider = create_feature_provider(INPUT_NAME, &ml_array)
             .expect("Failed to create feature provider");
@@ -319,13 +347,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Will be enabled when logits extraction is implemented
+    #[ignore] // Ready for real model - remove ignore to test
     fn test_logits_extraction() {
         let model_path = Path::new(MODEL_PATH);
+        let tokenizer_path = Path::new(TOKENIZER_PATH);
+        
         let model = load_model(model_path).expect("Failed to load model");
+        let tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
         
         let device = Device::Cpu;
-        let tensor = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0], (1, 5), &device).unwrap();
+        let prompt = "The quick brown fox";
+        let tensor = prepare_model_input(prompt, &tokenizer, &device)
+            .expect("Failed to prepare model input");
         let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
         let provider = create_feature_provider(INPUT_NAME, &ml_array)
             .expect("Failed to create feature provider");
@@ -336,11 +369,12 @@ mod tests {
         let logits = extract_logits(&*prediction, OUTPUT_NAME)
             .expect("Failed to extract logits");
         
-        assert!(!logits.is_empty(), "Should have logits");
+        // Verify output shape: should be (1 * 128 * 32000) = 4,096,000 logits
+        let expected_size = 1 * MAX_SEQUENCE_LENGTH * VOCAB_SIZE;
+        assert_eq!(logits.len(), expected_size, "Logits should have shape (1, 128, 32000)");
     }
 
     #[test]
-    #[ignore] // Will be enabled when full pipeline is implemented
     fn test_quick_brown_fox_prediction() {
         let model_path = Path::new(MODEL_PATH);
         let tokenizer_path = Path::new(TOKENIZER_PATH);
@@ -348,14 +382,17 @@ mod tests {
         let model = load_model(model_path).expect("Failed to load model");
         let tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
         
-        let prompt = "The quick brown fox jumps over the lazy";
-        let encoding = tokenizer.encode(prompt, true).expect("Failed to encode prompt");
-        let tokens = encoding.get_ids();
-        
-        // Convert to tensor
         let device = Device::Cpu;
-        let tokens_f32: Vec<f32> = tokens.iter().map(|&x| x as f32).collect();
-        let tensor = Tensor::from_vec(tokens_f32, (1, tokens.len()), &device).unwrap();
+        let prompt = "The quick brown fox jumps over the lazy";
+        
+        // Get original tokens to find actual length
+        let encoding = tokenizer.encode(prompt, true).expect("Failed to encode prompt");
+        let original_tokens = encoding.get_ids().to_vec();
+        let actual_len = original_tokens.len().min(MAX_SEQUENCE_LENGTH);
+        
+        // Use proper input preparation with padding/truncation to 128
+        let tensor = prepare_model_input(prompt, &tokenizer, &device)
+            .expect("Failed to prepare model input");
         
         // Convert to MLMultiArray
         let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
@@ -368,18 +405,28 @@ mod tests {
         let prediction = run_model_prediction(&model, &provider)
             .expect("Failed to run model prediction");
         
-        // Extract logits
+        // Extract logits - shape should be (1, 128, 32000) flattened
         let logits = extract_logits(&*prediction, OUTPUT_NAME)
             .expect("Failed to extract logits");
         
-        // Get last token logits (for next token prediction)
-        let vocab_size = tokenizer.get_vocab_size(true);
-        let sequence_length = tokens.len();
-        let last_token_start = (sequence_length - 1) * vocab_size;
-        let last_token_logits = &logits[last_token_start..last_token_start + vocab_size];
+        // For next-token prediction: use only the last non-pad position's logits
+        // Use actual token length, not the padded position
+        let last_pos = actual_len - 1;
+        let last_position_start = last_pos * VOCAB_SIZE;
+        let last_token_logits = &logits[last_position_start..last_position_start + VOCAB_SIZE];
         
         // Find most likely next token
         let next_token_id = argmax(last_token_logits) as u32;
+        
+        println!("Prompt: '{}'", prompt);
+        println!("Actual token length: {}, using position: {}", actual_len, last_pos);
+        println!("Predicted token ID: {}", next_token_id);
+        println!("Top 5 logits at position {}:", last_pos);
+        let mut indexed_logits: Vec<(usize, f32)> = last_token_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for (i, (token_id, logit_value)) in indexed_logits.iter().take(5).enumerate() {
+            println!("  {}: token_id={}, logit={:.4}", i+1, token_id, logit_value);
+        }
         
         // Decode next token
         let next_token_str = tokenizer.decode(&[next_token_id], true)
@@ -387,9 +434,19 @@ mod tests {
         
         println!("Next token predicted: '{}'", next_token_str.trim());
         
-        // The expectation is that it should predict "dog"
-        // This assertion will fail until the full pipeline works
-        assert_eq!(next_token_str.trim(), "dog", "Should predict 'dog' to complete the phrase");
+        // Log the completion for verification 
+        if !next_token_str.trim().is_empty() {
+            let completion = format!("{} {}", prompt, next_token_str.trim());
+            println!("Full completion: '{}'", completion);
+        } else {
+            println!("Model predicted token ID 0 (pad token) or empty string");
+        }
+        
+        // FAIL if we don't get "dog" - any language model should predict this!
+        let predicted_word = next_token_str.trim().to_lowercase();
+        assert_eq!(predicted_word, "dog", 
+            "Model should predict 'dog' after 'The quick brown fox jumps over the lazy' but got: '{}'", 
+            predicted_word);
     }
 
     #[test]
@@ -400,20 +457,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Unit test for extract_logits - compiles and verifies objc glue
+    #[ignore] // Ready for real model - remove ignore to test
     fn test_extract_logits_unit() {
-        // Build a 1-element MLMultiArray
+        let model_path = Path::new(MODEL_PATH);
+        let tokenizer_path = Path::new(TOKENIZER_PATH);
+        
+        let model = load_model(model_path).unwrap();
+        let tokenizer = load_tokenizer(tokenizer_path).unwrap();
+        
         let device = Device::Cpu;
-        let tensor = Tensor::from_vec(vec![3.14f32], (1, 1), &device).unwrap();
+        let prompt = "Hello world";
+        let tensor = prepare_model_input(prompt, &tokenizer, &device).unwrap();
         let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
 
-        let provider = create_feature_provider("logits", &ml_array).unwrap();
-        let model = load_model(Path::new(MODEL_PATH)).unwrap();
+        let provider = create_feature_provider(INPUT_NAME, &ml_array).unwrap();
         let pred = run_model_prediction(&model, &provider).unwrap();
-        let logits = extract_logits(&*pred, "logits").unwrap();
+        let logits = extract_logits(&*pred, OUTPUT_NAME).unwrap();
 
-        assert_eq!(logits.len(), 1);
-        assert!((logits[0] - 3.14f32).abs() < 1e-5);
+        // Should extract exactly (1 * 128 * 32000) logits
+        let expected_size = 1 * MAX_SEQUENCE_LENGTH * VOCAB_SIZE;
+        assert_eq!(logits.len(), expected_size);
     }
 }
 
