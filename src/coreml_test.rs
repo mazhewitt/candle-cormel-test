@@ -16,6 +16,7 @@ use objc2_core_ml::{
     MLDictionaryFeatureProvider, MLFeatureProvider
 };
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
+use objc2::runtime::ProtocolObject;
 use std::env;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -88,67 +89,87 @@ fn create_feature_provider(
     input_name: &str,
     input_array: &MLMultiArray,
 ) -> Result<Retained<MLDictionaryFeatureProvider>, String> {
-    // The objc2 NSDictionary creation with proper NSCopying protocols requires
-    // very specific type casting that is complex. For now, we'll use a stub
-    // that documents the approach but allows compilation.
-    let _ = (input_name, input_array);
-    
-    // TODO: Need to implement NSDictionary creation with proper protocol handling:
-    // 1. MLFeatureValue from input_array 
-    // 2. NSString key with NSCopying protocol
-    // 3. NSDictionary creation with AnyObject values
-    // 4. MLDictionaryFeatureProvider init
-    
-    // This would be the pattern if type system complexity is resolved:
-    // objc2::rc::autoreleasepool(|_| {
-    //     let key = NSString::from_str(input_name);
-    //     let value = unsafe { MLFeatureValue::featureValueWithMultiArray(input_array) };
-    //     let dict = /* proper NSDictionary creation */;
-    //     unsafe { MLDictionaryFeatureProvider::initWithDictionary_error(...) }
-    // })
-    
-    Err("NSDictionary creation with NSCopying protocol requires further objc2 type system work".to_string())
+    use objc2::runtime::ProtocolObject;
+    use objc2_foundation::{ns_string, NSDictionary, NSString};
+    use objc2_core_ml::{MLDictionaryFeatureProvider, MLFeatureValue};
+    use objc2::runtime::AnyObject;
+
+    objc2::rc::autoreleasepool(|_| {
+        // Key and value
+        let key = NSString::from_str(input_name);          // Retained<NSString>
+        let value = unsafe { MLFeatureValue::featureValueWithMultiArray(input_array) };
+
+        // Build single-pair dictionary
+        let dict: Retained<NSDictionary<NSString, AnyObject>> =
+            NSDictionary::from_slices::<NSString>(&[&*key], &[&*value]);
+
+        // Create the provider
+        unsafe {
+            MLDictionaryFeatureProvider::initWithDictionary_error(
+                MLDictionaryFeatureProvider::alloc(),
+                dict.as_ref(),
+            )
+        }
+        .map_err(|e| format!("CoreML initWithDictionary_error: {:?}", e))
+    })
 }
 
 /// Runs actual model prediction - NO MOCKS
 fn run_model_prediction(
     model: &MLModel,
     provider: &MLDictionaryFeatureProvider,
-) -> Result<Retained<dyn MLFeatureProvider>, String> {
-    // The objc2 trait system requires ProtocolObject<dyn MLFeatureProvider> casting
-    // and MLDictionaryFeatureProvider to &ProtocolObject<dyn MLFeatureProvider> conversion
-    let _ = (model, provider);
-    
-    // TODO: Implement with proper protocol object handling:
-    // objc2::rc::autoreleasepool(|_| unsafe {
-    //     model.predictionFromFeatures_error(provider as &ProtocolObject<dyn MLFeatureProvider>)
-    //         .map(|result| /* convert ProtocolObject to dyn trait */)
-    //         .map_err(|e| format!("CoreML prediction error: {:?}", e))
-    // })
-    
-    Err("MLModel.predictionFromFeatures_error requires ProtocolObject trait casting".to_string())
+) -> Result<Retained<ProtocolObject<dyn MLFeatureProvider>>, String> {
+    use objc2::runtime::ProtocolObject;
+    use objc2_core_ml::MLFeatureProvider;
+
+    objc2::rc::autoreleasepool(|_| unsafe {
+        // Convert MLDictionaryFeatureProvider to ProtocolObject
+        let protocol_provider = ProtocolObject::from_ref(provider);
+        
+        model
+            .predictionFromFeatures_error(protocol_provider)
+            .map_err(|e| format!("CoreML prediction error: {:?}", e))
+    })
 }
 
 /// Extracts logits from model output - NO MOCKS
 fn extract_logits(
-    prediction: &dyn MLFeatureProvider,
+    prediction: &ProtocolObject<dyn MLFeatureProvider>,
     output_name: &str,
 ) -> Result<Vec<f32>, String> {
-    // The objc2 trait object system doesn't allow calling methods on dyn MLFeatureProvider
-    // Need to work with concrete ProtocolObject<dyn MLFeatureProvider> instead
-    let _ = (prediction, output_name);
-    
-    // TODO: Implement with proper protocol object handling:
-    // objc2::rc::autoreleasepool(|_| unsafe {
-    //     let name = NSString::from_str(output_name);
-    //     let value = prediction.featureValueForName(&name) // requires concrete type
-    //         .ok_or_else(|| format!("Output '{}' not found", output_name))?;
-    //     let marray = value.multiArrayValue()
-    //         .ok_or_else(|| format!("Output '{}' is not MLMultiArray", output_name))?;
-    //     // ... rest of implementation
-    // })
-    
-    Err("MLFeatureProvider trait object methods require concrete ProtocolObject type".to_string())
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let name = NSString::from_str(output_name);
+        let value = prediction
+            .featureValueForName(&name)
+            .ok_or_else(|| format!("Output '{}' not found", output_name))?;
+
+        let marray = value
+            .multiArrayValue()
+            .ok_or_else(|| format!("Output '{}' is not MLMultiArray", output_name))?;
+
+        let count = marray.count() as usize;
+        let mut buf = vec![0.0f32; count];
+        
+        // Use a cell pattern to allow mutation in the Fn closure
+        use std::cell::RefCell;
+        let buf_cell = RefCell::new(&mut buf);
+        
+        marray.getBytesWithHandler(&block2::StackBlock::new(
+            |ptr: std::ptr::NonNull<std::ffi::c_void>, len: isize| {
+                let src = ptr.as_ptr() as *const f32;
+                let copy_elements = count.min(len as usize / std::mem::size_of::<f32>());
+                if copy_elements > 0 && len as usize >= copy_elements * std::mem::size_of::<f32>() {
+                    unsafe {
+                        if let Ok(mut buf_ref) = buf_cell.try_borrow_mut() {
+                            std::ptr::copy_nonoverlapping(src, buf_ref.as_mut_ptr(), copy_elements);
+                        }
+                    }
+                }
+            },
+        ));
+
+        Ok(buf)
+    })
 }
 
 /// Finds the token with highest probability
@@ -274,11 +295,11 @@ mod tests {
         let tensor = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0], (1, 5), &device).unwrap();
         let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
         
-        let result = create_feature_provider(INPUT_NAME, &ml_array);
+        let provider = create_feature_provider(INPUT_NAME, &ml_array)
+            .expect("Failed to create feature provider");
         
-        // This test should fail until the objc2 type system complexity is resolved
-        assert!(result.is_err(), "Feature provider creation should fail until implemented");
-        assert!(result.unwrap_err().contains("NSCopying protocol"), "Error should mention NSCopying protocol issue");
+        // Feature provider should be created successfully - just verify it exists
+        // (No need to check null since Retained<> guarantees non-null)
     }
 
     #[test]
