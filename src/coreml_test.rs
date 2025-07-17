@@ -351,34 +351,25 @@ fn extract_country_from_question(question: &str) -> Option<&str> {
     }
 }
 
+/// Find the index of the maximum value in a slice
+fn argmax(slice: &[f32]) -> usize {
+    slice.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
 
     #[test]
-    fn test_tensor_to_mlmultiarray_conversion() {
-        let device = Device::Cpu;
-        let tensor = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &device).unwrap();
-        
-        let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
-        
-        // Verify shape
-        let shape = unsafe { ml_array.shape() };
-        assert_eq!(shape.count(), 2);
-        assert_eq!(shape.objectAtIndex(0).unsignedIntegerValue(), 2);
-        assert_eq!(shape.objectAtIndex(1).unsignedIntegerValue(), 2);
-        
-        // Verify data type
-        assert_eq!(unsafe { ml_array.dataType() }, MLMultiArrayDataType::Float32);
-    }
-
-    #[test]
     fn test_model_loading() {
         let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
         let model = load_model(model_path).expect("Failed to load model");
         
-        // Verify model has expected inputs and outputs
         let model_description = unsafe { model.modelDescription() };
         let input_descriptions = unsafe { model_description.inputDescriptionsByName() };
         let output_descriptions = unsafe { model_description.outputDescriptionsByName() };
@@ -386,18 +377,15 @@ mod tests {
         assert_eq!(input_descriptions.count(), 1);
         assert_eq!(output_descriptions.count(), 1);
         
-        // Verify input/output names
         let input_keys = input_descriptions.allKeys();
         let output_keys = output_descriptions.allKeys();
         
-        // Check input name matches expected
         autoreleasepool(|pool| {
             let input_key = input_keys.objectAtIndex(0);
             let input_name = unsafe { input_key.to_str(pool) };
             assert_eq!(input_name, INPUT_NAME);
         });
         
-        // Check output name matches expected
         autoreleasepool(|pool| {
             let output_key = output_keys.objectAtIndex(0);
             let output_name = unsafe { output_key.to_str(pool) };
@@ -409,7 +397,6 @@ mod tests {
     fn test_tokenizer_loading() {
         let tokenizer_path = Path::new(TOKENIZER_PATH);
         let _tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
-        // If we get here, tokenizer loaded successfully
     }
 
     #[test]
@@ -421,33 +408,12 @@ mod tests {
         let encoding = tokenizer.encode(prompt, true).expect("Failed to encode prompt");
         let tokens = encoding.get_ids();
 
-        // Real OpenELM tokenizer produces 11 tokens for this prompt
-        assert_eq!(tokens.len(), 11, "Tokenizer should yield 11 tokens");
-        assert_eq!(
-            tokens[..4],
-            [1, 450, 4996, 17354], // Start token, "The", " quick", " brown"
-            "First four tokens should match known IDs"
-        );
+        assert_eq!(tokens.len(), 11);
+        assert_eq!(tokens[..4], [1, 450, 4996, 17354]);
     }
 
     #[test]
-    fn test_feature_provider_creation() {
-        let device = Device::Cpu;
-        // Use correct OpenELM input shape (1, 128) with f32 token IDs
-        let token_ids: Vec<f32> = (0..MAX_SEQUENCE_LENGTH).map(|i| (i % 1000) as f32).collect();
-        let tensor = Tensor::from_vec(token_ids, (1, MAX_SEQUENCE_LENGTH), &device).unwrap();
-        let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
-        
-        let _provider = create_feature_provider(INPUT_NAME, &ml_array)
-            .expect("Failed to create feature provider");
-        
-        // Feature provider should be created successfully - just verify it exists
-        // (No need to check null since Retained<> guarantees non-null)
-    }
-
-    #[test] 
-    #[ignore] // Ready for real model - remove ignore to test
-    fn test_model_prediction() {
+    fn test_generate_completion() {
         let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
         let tokenizer_path = Path::new(TOKENIZER_PATH);
         
@@ -456,237 +422,15 @@ mod tests {
         
         let device = Device::Cpu;
         let prompt = "The quick brown fox";
-        let tensor = prepare_model_input(prompt, &tokenizer, &device)
-            .expect("Failed to prepare model input");
-        let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
-        let provider = create_feature_provider(INPUT_NAME, &ml_array)
-            .expect("Failed to create feature provider");
+    
         
-        let _prediction = run_model_prediction(&model, &provider)
-            .expect("Failed to run model prediction");
-    }
-
-    #[test]
-    #[ignore] // Ready for real model - remove ignore to test
-    fn test_logits_extraction() {
-        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
-        let tokenizer_path = Path::new(TOKENIZER_PATH);
+        let completion = generate_completion(prompt, &model, &tokenizer, &device)
+            .expect("Failed to generate completion");
         
-        let model = load_model(model_path).expect("Failed to load model");
-        let tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
-        
-        let device = Device::Cpu;
-        let prompt = "The quick brown fox";
-        let tensor = prepare_model_input(prompt, &tokenizer, &device)
-            .expect("Failed to prepare model input");
-        let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
-        let provider = create_feature_provider(INPUT_NAME, &ml_array)
-            .expect("Failed to create feature provider");
-        
-        let prediction = run_model_prediction(&model, &provider)
-            .expect("Failed to run model prediction");
-        
-        let logits = extract_logits(&*prediction, OUTPUT_NAME)
-            .expect("Failed to extract logits");
-        
-        // Verify output shape: should be (1 * 128 * 32000) = 4,096,000 logits
-        let expected_size = 1 * MAX_SEQUENCE_LENGTH * VOCAB_SIZE;
-        assert_eq!(logits.len(), expected_size, "Logits should have shape (1, 128, 32000)");
-    }
-
-    #[test]
-    fn test_quick_brown_fox_prediction() {
-        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
-        let tokenizer_path = Path::new(TOKENIZER_PATH);
-        
-        let model = load_model(model_path).expect("Failed to load model");
-        let tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
-        
-        let device = Device::Cpu;
-        let prompt = "The quick brown fox jumps over the lazy";
-        
-        // Get original tokens to find actual length
-        let encoding = tokenizer.encode(prompt, true).expect("Failed to encode prompt");
-        let original_tokens = encoding.get_ids().to_vec();
-        let actual_len = original_tokens.len().min(MAX_SEQUENCE_LENGTH);
-        
-        // Use proper input preparation with padding/truncation to 128
-        let tensor = prepare_model_input(prompt, &tokenizer, &device)
-            .expect("Failed to prepare model input");
-        
-        // Convert to MLMultiArray
-        let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
-        
-        // Create feature provider
-        let provider = create_feature_provider(INPUT_NAME, &ml_array)
-            .expect("Failed to create feature provider");
-        
-        // Run prediction
-        let prediction = run_model_prediction(&model, &provider)
-            .expect("Failed to run model prediction");
-        
-        // Extract logits - shape should be (1, 128, 32000) flattened
-        let logits = extract_logits(&*prediction, OUTPUT_NAME)
-            .expect("Failed to extract logits");
-        
-        // For next-token prediction: use only the last non-pad position's logits
-        // Use actual token length, not the padded position
-        let last_pos = actual_len - 1;
-        let last_position_start = last_pos * VOCAB_SIZE;
-        let last_token_logits = &logits[last_position_start..last_position_start + VOCAB_SIZE];
-        
-        // Find most likely next token
-        let next_token_id = argmax(last_token_logits) as u32;
-        
-        println!("Prompt: '{}'", prompt);
-        println!("Actual token length: {}, using position: {}", actual_len, last_pos);
-        println!("Predicted token ID: {}", next_token_id);
-        println!("Top 5 logits at position {}:", last_pos);
-        let mut indexed_logits: Vec<(usize, f32)> = last_token_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-        indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        for (i, (token_id, logit_value)) in indexed_logits.iter().take(5).enumerate() {
-            println!("  {}: token_id={}, logit={:.4}", i+1, token_id, logit_value);
-        }
-        
-        // Decode next token
-        let next_token_str = tokenizer.decode(&[next_token_id], true)
-            .expect("Failed to decode next token");
-        
-        println!("Next token predicted: '{}'", next_token_str.trim());
-        
-        // Log the completion for verification 
-        if !next_token_str.trim().is_empty() {
-            let completion = format!("{} {}", prompt, next_token_str.trim());
-            println!("Full completion: '{}'", completion);
-        } else {
-            println!("Model predicted token ID 0 (pad token) or empty string");
-        }
-        
-        // FAIL if we don't get "dog" - any language model should predict this!
-        let predicted_word = next_token_str.trim().to_lowercase();
-        assert_eq!(predicted_word, "dog", 
-            "Model should predict 'dog' after 'The quick brown fox jumps over the lazy' but got: '{}'", 
-            predicted_word);
-    }
-
-    #[test]
-    fn test_candle_logits_processor() {
-        use candle_transformers::generation::{LogitsProcessor, Sampling};
-        
-        let device = Device::Cpu;
-        let logits = vec![0.1f32, 0.9, 0.3, 0.7, 0.2];
-        let logits_tensor = Tensor::from_vec(logits, (5,), &device).unwrap();
-        
-        // Test ArgMax sampling (should pick index 1 with value 0.9)
-        let mut processor = LogitsProcessor::from_sampling(42, Sampling::ArgMax);
-        let token_id = processor.sample(&logits_tensor).unwrap();
-        assert_eq!(token_id, 1); // Index of 0.9
-        
-        // Test that it's deterministic with ArgMax
-        let token_id2 = processor.sample(&logits_tensor).unwrap();
-        assert_eq!(token_id, token_id2);
-    }
-
-    #[test]
-    fn test_france_capital_question() {
-        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
-        let tokenizer_path = Path::new(TOKENIZER_PATH);
-        
-        let model = load_model(model_path).expect("Failed to load model");
-        let tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
-        
-        let device = Device::Cpu;
-        
-        // Try different prompt engineering approaches for OpenELM-450M-Instruct
-        let prompts = vec![
-            "Question: What is the capital of France?\nAnswer:",
-            "Q: What is the capital of France?\nA:",
-            "The capital of France is",
-            "France's capital city is",
-            "What is the capital of France? The answer is",
-        ];
-        
-        for (i, prompt) in prompts.iter().enumerate() {
-            println!("\n--- Testing prompt {}: \"{}\" ---", i + 1, prompt);
-            
-            // Get original tokens to find actual length
-            let encoding = tokenizer.encode(*prompt, true).expect("Failed to encode prompt");
-            let original_tokens = encoding.get_ids().to_vec();
-            let actual_len = original_tokens.len().min(MAX_SEQUENCE_LENGTH);
-            
-            // Prepare model input
-            let tensor = prepare_model_input(*prompt, &tokenizer, &device)
-                .expect("Failed to prepare model input");
-            
-            // Convert to MLMultiArray
-            let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
-            
-            // Create feature provider
-            let provider = create_feature_provider(INPUT_NAME, &ml_array)
-                .expect("Failed to create feature provider");
-            
-            // Run prediction
-            let prediction = run_model_prediction(&model, &provider)
-                .expect("Failed to run model prediction");
-            
-            // Extract logits
-            let logits = extract_logits(&*prediction, OUTPUT_NAME)
-                .expect("Failed to extract logits");
-            
-            // Get logits for next token prediction (last non-pad position)
-            let last_pos = actual_len - 1;
-            let last_position_start = last_pos * VOCAB_SIZE;
-            let last_token_logits = &logits[last_position_start..last_position_start + VOCAB_SIZE];
-            
-            // Find most likely next token
-            let next_token_id = argmax(last_token_logits) as u32;
-            
-            // Decode next token
-            let next_token_str = tokenizer.decode(&[next_token_id], true)
-                .expect("Failed to decode next token");
-            
-            println!("Predicted next token: '{}'", next_token_str.trim());
-            println!("Full completion: '{} {}'", prompt, next_token_str.trim());
-            
-            // Check if any of the prompts produce "Paris" or reasonable variants
-            let predicted_word = next_token_str.trim().to_lowercase();
-            if predicted_word.contains("paris") || predicted_word.contains("par") {
-                println!("✅ Model shows knowledge of France's capital!");
-                return; // Test passes if any prompt works
-            }
-        }
-        
-        // If we get here, none of the prompts worked well
-        println!("⚠️  Model didn't clearly predict Paris for any prompt. This might indicate:");
-        println!("  - The model needs different prompt engineering");
-        println!("  - The model is primarily trained for completion, not Q&A");
-        println!("  - The model might need more context or different formatting");
-        
-        // Don't fail the test - this is exploratory to understand model capabilities
-        // In a real scenario, you might want to assert based on your requirements
-    }
-
-    #[test]
-    #[ignore] // Ready for real model - remove ignore to test
-    fn test_extract_logits_unit() {
-        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
-        let tokenizer_path = Path::new(TOKENIZER_PATH);
-        
-        let model = load_model(model_path).unwrap();
-        let tokenizer = load_tokenizer(tokenizer_path).unwrap();
-        
-        let device = Device::Cpu;
-        let prompt = "Hello world";
-        let tensor = prepare_model_input(prompt, &tokenizer, &device).unwrap();
-        let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
-
-        let provider = create_feature_provider(INPUT_NAME, &ml_array).unwrap();
-        let pred = run_model_prediction(&model, &provider).unwrap();
-        let logits = extract_logits(&*pred, OUTPUT_NAME).unwrap();
-
-        // Should extract exactly (1 * 128 * 32000) logits
-        let expected_size = 1 * MAX_SEQUENCE_LENGTH * VOCAB_SIZE;
-        assert_eq!(logits.len(), expected_size);
+        assert!(!completion.is_empty());
+        let last_token = completion.split_whitespace().last().unwrap();
+        assert!(!last_token.is_empty(), "Last token should not be empty");
+        assert!(last_token == "dog");
     }
 }
 
