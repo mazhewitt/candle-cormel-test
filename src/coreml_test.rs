@@ -12,17 +12,16 @@ use candle_core::{Device, Tensor, Error as CandleError};
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::AnyThread;
 use objc2_core_ml::{
-    MLModel, MLMultiArray, MLMultiArrayDataType, MLFeatureValue, 
+    MLModel, MLMultiArray, MLMultiArrayDataType,
     MLDictionaryFeatureProvider, MLFeatureProvider
 };
-use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
+use objc2_foundation::{NSArray, NSNumber, NSString, NSURL};
 use objc2::runtime::ProtocolObject;
 use std::env;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
 // Test configuration - OpenELM-450M-Instruct model specifications
-const MODEL_PATH: &str = "OpenELM-450M-Instruct-128-float32.mlmodelc";
 const TOKENIZER_PATH: &str = "tokenizer.json";
 const INPUT_NAME: &str = "input_ids";
 const OUTPUT_NAME: &str = "logits";
@@ -92,8 +91,7 @@ fn create_feature_provider(
     input_name: &str,
     input_array: &MLMultiArray,
 ) -> Result<Retained<MLDictionaryFeatureProvider>, String> {
-    use objc2::runtime::ProtocolObject;
-    use objc2_foundation::{ns_string, NSDictionary, NSString};
+    use objc2_foundation::{NSDictionary, NSString};
     use objc2_core_ml::{MLDictionaryFeatureProvider, MLFeatureValue};
     use objc2::runtime::AnyObject;
 
@@ -122,8 +120,6 @@ fn run_model_prediction(
     model: &MLModel,
     provider: &MLDictionaryFeatureProvider,
 ) -> Result<Retained<ProtocolObject<dyn MLFeatureProvider>>, String> {
-    use objc2::runtime::ProtocolObject;
-    use objc2_core_ml::MLFeatureProvider;
 
     objc2::rc::autoreleasepool(|_| unsafe {
         // Convert MLDictionaryFeatureProvider to ProtocolObject
@@ -135,7 +131,7 @@ fn run_model_prediction(
     })
 }
 
-/// Extracts logits from model output - NO MOCKS
+/// Extracts logits from model output 
 fn extract_logits(
     prediction: &ProtocolObject<dyn MLFeatureProvider>,
     output_name: &str,
@@ -162,10 +158,8 @@ fn extract_logits(
                 let src = ptr.as_ptr() as *const f32;
                 let copy_elements = count.min(len as usize / std::mem::size_of::<f32>());
                 if copy_elements > 0 && len as usize >= copy_elements * std::mem::size_of::<f32>() {
-                    unsafe {
-                        if let Ok(mut buf_ref) = buf_cell.try_borrow_mut() {
-                            std::ptr::copy_nonoverlapping(src, buf_ref.as_mut_ptr(), copy_elements);
-                        }
+                    if let Ok(mut buf_ref) = buf_cell.try_borrow_mut() {
+                        std::ptr::copy_nonoverlapping(src, buf_ref.as_mut_ptr(), copy_elements);
                     }
                 }
             },
@@ -231,6 +225,48 @@ fn load_tokenizer(path: &Path) -> Result<Tokenizer, String> {
         .map_err(|e| format!("Failed to load tokenizer: {}", e))
 }
 
+/// Generate text completion using CoreML model
+fn generate_completion(
+    prompt: &str,
+    model: &MLModel,
+    tokenizer: &Tokenizer,
+    device: &Device,
+) -> Result<String, String> {
+    // Get original tokens to find actual length
+    let encoding = tokenizer.encode(prompt, true).map_err(|e| format!("Tokenization failed: {}", e))?;
+    let original_tokens = encoding.get_ids().to_vec();
+    let actual_len = original_tokens.len().min(MAX_SEQUENCE_LENGTH);
+    
+    // Prepare model input
+    let tensor = prepare_model_input(prompt, tokenizer, device)?;
+    let ml_array = tensor_to_mlmultiarray(&tensor)
+        .map_err(|e| format!("Tensor conversion failed: {}", e))?;
+    
+    // Create feature provider
+    let provider = create_feature_provider(INPUT_NAME, &ml_array)?;
+    
+    // Run prediction
+    let prediction = run_model_prediction(model, &provider)?;
+    
+    // Extract logits
+    let logits = extract_logits(&*prediction, OUTPUT_NAME)?;
+    
+    // Get logits for next token prediction (last non-pad position)
+    let last_pos = actual_len - 1;
+    let last_position_start = last_pos * VOCAB_SIZE;
+    let last_token_logits = &logits[last_position_start..last_position_start + VOCAB_SIZE];
+    
+    // Find most likely next token
+    let next_token_id = argmax(last_token_logits) as u32;
+    
+    // Decode next token
+    let next_token_str = tokenizer.decode(&[next_token_id], true)
+        .map_err(|e| format!("Failed to decode token: {}", e))?;
+    
+    // Return the complete text
+    Ok(format!("{} {}", prompt, next_token_str.trim()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_model_loading() {
-        let model_path = Path::new(MODEL_PATH);
+        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
         let model = load_model(model_path).expect("Failed to load model");
         
         // Verify model has expected inputs and outputs
@@ -328,7 +364,7 @@ mod tests {
     #[test] 
     #[ignore] // Ready for real model - remove ignore to test
     fn test_model_prediction() {
-        let model_path = Path::new(MODEL_PATH);
+        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
         let tokenizer_path = Path::new(TOKENIZER_PATH);
         
         let model = load_model(model_path).expect("Failed to load model");
@@ -349,7 +385,7 @@ mod tests {
     #[test]
     #[ignore] // Ready for real model - remove ignore to test
     fn test_logits_extraction() {
-        let model_path = Path::new(MODEL_PATH);
+        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
         let tokenizer_path = Path::new(TOKENIZER_PATH);
         
         let model = load_model(model_path).expect("Failed to load model");
@@ -376,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_quick_brown_fox_prediction() {
-        let model_path = Path::new(MODEL_PATH);
+        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
         let tokenizer_path = Path::new(TOKENIZER_PATH);
         
         let model = load_model(model_path).expect("Failed to load model");
@@ -459,7 +495,7 @@ mod tests {
     #[test]
     #[ignore] // Ready for real model - remove ignore to test
     fn test_extract_logits_unit() {
-        let model_path = Path::new(MODEL_PATH);
+        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
         let tokenizer_path = Path::new(TOKENIZER_PATH);
         
         let model = load_model(model_path).unwrap();
@@ -483,8 +519,8 @@ mod tests {
 fn main() {
     let args: Vec<String> = env::args().collect();
     
-    println!("CoreML Integration Test Runner");
-    println!("==============================");
+    println!("CoreML Text Generation");
+    println!("=====================");
     
     if args.len() < 2 {
         println!("Usage: {} <model_path.mlmodelc>", args[0]);
@@ -495,34 +531,100 @@ fn main() {
     }
     
     let model_path = Path::new(&args[1]);
-    println!("Testing with model: {}", model_path.display());
+    let tokenizer_path = Path::new(TOKENIZER_PATH);
     
-    // Basic smoke test
-    match load_model(model_path) {
+    // Load model and tokenizer
+    let model = match load_model(model_path) {
         Ok(model) => {
-            println!("✅ Model loaded successfully!");
-            let model_description = unsafe { model.modelDescription() };
-            println!("  Input features: {}", unsafe { model_description.inputDescriptionsByName().count() });
-            println!("  Output features: {}", unsafe { model_description.outputDescriptionsByName().count() });
+            println!("✅ Model loaded: {}", model_path.display());
+            model
         }
         Err(e) => {
             println!("❌ Model loading failed: {}", e);
+            return;
         }
-    }
+    };
     
-    // Test tokenizer
-    let tokenizer_path = Path::new(TOKENIZER_PATH);
-    match load_tokenizer(tokenizer_path) {
+    let tokenizer = match load_tokenizer(tokenizer_path) {
         Ok(tokenizer) => {
-            println!("✅ Tokenizer loaded successfully!");
-            println!("  Vocab size: {}", tokenizer.get_vocab_size(true));
+            println!("✅ Tokenizer loaded: {}", tokenizer_path.display());
+            tokenizer
         }
         Err(e) => {
             println!("❌ Tokenizer loading failed: {}", e);
+            return;
         }
-    }
+    };
     
     println!();
-    println!("Run 'cargo test --bin coreml_test' to run all tests");
-    println!("Run 'cargo test --bin coreml_test -- --ignored' to run ignored tests");
+    
+    // Read from stdin and generate completions
+    use std::io::{self, Write, IsTerminal, Read};
+    let device = Device::Cpu;
+    
+    if io::stdin().is_terminal() {
+        // Interactive mode
+        println!("Enter text to complete (Ctrl+C to exit):");
+        
+        loop {
+            print!("> ");
+            io::stdout().flush().unwrap();
+            
+            let mut input = String::new();
+            match io::stdin().read_line(&mut input) {
+                Ok(0) => {
+                    // EOF reached
+                    println!("Goodbye!");
+                    break;
+                }
+                Ok(_) => {
+                    let prompt = input.trim();
+                    if prompt.is_empty() {
+                        continue;
+                    }
+                    
+                    // Generate completion
+                    match generate_completion(prompt, &model, &tokenizer, &device) {
+                        Ok(completion) => {
+                            println!("Completion: {}", completion);
+                        }
+                        Err(e) => {
+                            println!("❌ Generation failed: {}", e);
+                        }
+                    }
+                    println!();
+                }
+                Err(e) => {
+                    println!("❌ Error reading input: {}", e);
+                    break;
+                }
+            }
+        }
+    } else {
+        // Piped/batch mode - read all input and process each line
+        let mut input = String::new();
+        match io::stdin().read_to_string(&mut input) {
+            Ok(_) => {
+                for line in input.lines() {
+                    let prompt = line.trim();
+                    if prompt.is_empty() {
+                        continue;
+                    }
+                    
+                    // Generate completion
+                    match generate_completion(prompt, &model, &tokenizer, &device) {
+                        Ok(completion) => {
+                            println!("{}", completion);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Generation failed for '{}': {}", prompt, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Error reading piped input: {}", e);
+            }
+        }
+    }
 }
