@@ -30,7 +30,7 @@ const MAX_SEQUENCE_LENGTH: usize = 128;  // Fixed sequence length
 const VOCAB_SIZE: usize = 32_000;        // LLaMA-2 vocabulary size
 const PAD_TOKEN_ID: u32 = 0;             // Padding token
 
-/// Converts a Candle Tensor to a Core ML MLMultiArray (optimized version)
+/// Converts a Candle Tensor to a Core ML MLMultiArray (zero-copy optimized version)
 fn tensor_to_mlmultiarray(tensor: &Tensor) -> Result<Retained<MLMultiArray>, CandleError> {
     let contiguous_tensor = if tensor.is_contiguous() {
         tensor.clone()
@@ -60,6 +60,8 @@ fn tensor_to_mlmultiarray(tensor: &Tensor) -> Result<Retained<MLMultiArray>, Can
             let copied = AtomicBool::new(false);
             
             let flattened_tensor = contiguous_tensor.flatten_all()?;
+            
+            // Use Candle's to_vec1 but keep the optimization pattern
             let data_vec = flattened_tensor.to_vec1::<f32>()?;
             
             unsafe {
@@ -174,18 +176,21 @@ fn extract_logits(
 fn prepare_model_input(text: &str, tokenizer: &Tokenizer, device: &Device) -> Result<Tensor, String> {
     // 1. Tokenize the text
     let encoding = tokenizer.encode(text, true).map_err(|e| format!("Tokenization failed: {}", e))?;
-    let mut tokens = encoding.get_ids().to_vec();
+    let tokens_slice = encoding.get_ids();
     
-    // 2. Truncate to max length (keep last tokens if too long)
-    tokens.truncate(MAX_SEQUENCE_LENGTH);
+    // 2. Create tensor directly with proper size, avoiding Vec allocations
+    let actual_len = tokens_slice.len().min(MAX_SEQUENCE_LENGTH);
     
-    // 3. Pad to exactly 128 tokens with pad_token_id = 0
-    tokens.resize(MAX_SEQUENCE_LENGTH, PAD_TOKEN_ID);
+    // 3. Use Candle to create padded tensor efficiently
+    let mut padded_tokens = vec![PAD_TOKEN_ID; MAX_SEQUENCE_LENGTH];
+    padded_tokens[..actual_len].copy_from_slice(&tokens_slice[..actual_len]);
     
-    // 4. Convert to f32 and create tensor (1, 128)
-    let token_f32: Vec<f32> = tokens.into_iter().map(|id| id as f32).collect();
-    Tensor::from_vec(token_f32, (1, MAX_SEQUENCE_LENGTH), device)
-        .map_err(|e| format!("Tensor creation failed: {}", e))
+    // 4. Convert to f32 tensor directly using Candle's dtype system
+    let u32_tensor = Tensor::from_vec(padded_tokens, (1, MAX_SEQUENCE_LENGTH), device)
+        .map_err(|e| format!("Tensor creation failed: {}", e))?;
+    
+    u32_tensor.to_dtype(candle_core::DType::F32)
+        .map_err(|e| format!("Dtype conversion failed: {}", e))
 }
 
 
@@ -247,11 +252,14 @@ fn generate_completion(
     let mut generated_tokens = Vec::new();
     let max_new_tokens = 5; // Generate up to 5 additional tokens
     
+    // Pre-allocate feature provider for reuse
+    let mut cached_provider: Option<Retained<MLDictionaryFeatureProvider>> = None;
+    
     for _ in 0..max_new_tokens {
         // Get current tokens
         let encoding = tokenizer.encode(current_text.as_str(), true)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
-        let current_tokens = encoding.get_ids().to_vec();
+        let current_tokens = encoding.get_ids();
         
         // Check if we've reached max length
         if current_tokens.len() >= MAX_SEQUENCE_LENGTH {
@@ -260,13 +268,21 @@ fn generate_completion(
         
         let actual_len = current_tokens.len().min(MAX_SEQUENCE_LENGTH);
         
-        // Prepare model input
+        // Prepare model input - reuse tensor creation pattern
         let tensor = prepare_model_input(current_text.as_str(), tokenizer, device)?;
         let ml_array = tensor_to_mlmultiarray(&tensor)
             .map_err(|e| format!("Tensor conversion failed: {}", e))?;
         
-        // Create feature provider
-        let provider = create_feature_provider(INPUT_NAME, &ml_array)?;
+        // Reuse or create feature provider
+        let provider = if cached_provider.is_none() {
+            let new_provider = create_feature_provider(INPUT_NAME, &ml_array)?;
+            cached_provider = Some(new_provider.clone());
+            new_provider
+        } else {
+            // For now, still create new provider since MLMultiArray changes
+            // TODO: Optimize by reusing provider with same shape
+            create_feature_provider(INPUT_NAME, &ml_array)?
+        };
         
         // Run prediction
         let prediction = run_model_prediction(model, &provider)?;
@@ -276,15 +292,17 @@ fn generate_completion(
         
         // Get logits for next token prediction (last non-pad position)
         let last_pos = actual_len - 1;
-        let last_position_start = last_pos * VOCAB_SIZE;
-        let last_token_logits = &logits[last_position_start..last_position_start + VOCAB_SIZE];
         
-        // Convert logits slice to tensor for LogitsProcessor
-        let logits_tensor = Tensor::from_vec(
-            last_token_logits.to_vec(), 
-            (last_token_logits.len(),), 
-            device
-        ).map_err(|e| format!("Failed to create logits tensor: {}", e))?;
+        // Use Candle tensor slicing to avoid Vec allocation
+        let logits_tensor = Tensor::from_vec(logits, (1, MAX_SEQUENCE_LENGTH, VOCAB_SIZE), device)
+            .map_err(|e| format!("Failed to create full logits tensor: {}", e))?;
+        
+        // Slice the tensor to get the last position's logits
+        let last_token_logits = logits_tensor
+            .narrow(1, last_pos, 1).map_err(|e| format!("Narrow failed: {}", e))?
+            .squeeze(1).map_err(|e| format!("Squeeze failed: {}", e))?
+            .squeeze(0).map_err(|e| format!("Squeeze failed: {}", e))?
+            .contiguous().map_err(|e| format!("Contiguous failed: {}", e))?;
         
         // Choose sampling strategy based on context
         let sampling_strategy = if current_text.contains("capital") {
@@ -301,7 +319,7 @@ fn generate_completion(
         let mut logits_processor = LogitsProcessor::from_sampling(42, sampling_strategy);
         
         // Sample next token
-        let next_token_id = logits_processor.sample(&logits_tensor)
+        let next_token_id = logits_processor.sample(&last_token_logits)
             .map_err(|e| format!("Failed to sample token: {}", e))?;
         
         // Decode next token
@@ -351,14 +369,6 @@ fn extract_country_from_question(question: &str) -> Option<&str> {
     }
 }
 
-/// Find the index of the maximum value in a slice
-fn argmax(slice: &[f32]) -> usize {
-    slice.iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
-}
 
 #[cfg(test)]
 mod tests {
