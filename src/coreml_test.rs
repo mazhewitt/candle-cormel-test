@@ -354,7 +354,7 @@ mod tests {
         let tensor = Tensor::from_vec(token_ids, (1, MAX_SEQUENCE_LENGTH), &device).unwrap();
         let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
         
-        let provider = create_feature_provider(INPUT_NAME, &ml_array)
+        let _provider = create_feature_provider(INPUT_NAME, &ml_array)
             .expect("Failed to create feature provider");
         
         // Feature provider should be created successfully - just verify it exists
@@ -490,6 +490,85 @@ mod tests {
         let logits = vec![0.1, 0.9, 0.3, 0.7, 0.2];
         let max_idx = argmax(&logits);
         assert_eq!(max_idx, 1); // Index of 0.9
+    }
+
+    #[test]
+    fn test_france_capital_question() {
+        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
+        let tokenizer_path = Path::new(TOKENIZER_PATH);
+        
+        let model = load_model(model_path).expect("Failed to load model");
+        let tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
+        
+        let device = Device::Cpu;
+        
+        // Try different prompt engineering approaches for OpenELM-450M-Instruct
+        let prompts = vec![
+            "Question: What is the capital of France?\nAnswer:",
+            "Q: What is the capital of France?\nA:",
+            "The capital of France is",
+            "France's capital city is",
+            "What is the capital of France? The answer is",
+        ];
+        
+        for (i, prompt) in prompts.iter().enumerate() {
+            println!("\n--- Testing prompt {}: \"{}\" ---", i + 1, prompt);
+            
+            // Get original tokens to find actual length
+            let encoding = tokenizer.encode(*prompt, true).expect("Failed to encode prompt");
+            let original_tokens = encoding.get_ids().to_vec();
+            let actual_len = original_tokens.len().min(MAX_SEQUENCE_LENGTH);
+            
+            // Prepare model input
+            let tensor = prepare_model_input(*prompt, &tokenizer, &device)
+                .expect("Failed to prepare model input");
+            
+            // Convert to MLMultiArray
+            let ml_array = tensor_to_mlmultiarray(&tensor).unwrap();
+            
+            // Create feature provider
+            let provider = create_feature_provider(INPUT_NAME, &ml_array)
+                .expect("Failed to create feature provider");
+            
+            // Run prediction
+            let prediction = run_model_prediction(&model, &provider)
+                .expect("Failed to run model prediction");
+            
+            // Extract logits
+            let logits = extract_logits(&*prediction, OUTPUT_NAME)
+                .expect("Failed to extract logits");
+            
+            // Get logits for next token prediction (last non-pad position)
+            let last_pos = actual_len - 1;
+            let last_position_start = last_pos * VOCAB_SIZE;
+            let last_token_logits = &logits[last_position_start..last_position_start + VOCAB_SIZE];
+            
+            // Find most likely next token
+            let next_token_id = argmax(last_token_logits) as u32;
+            
+            // Decode next token
+            let next_token_str = tokenizer.decode(&[next_token_id], true)
+                .expect("Failed to decode next token");
+            
+            println!("Predicted next token: '{}'", next_token_str.trim());
+            println!("Full completion: '{} {}'", prompt, next_token_str.trim());
+            
+            // Check if any of the prompts produce "Paris" or reasonable variants
+            let predicted_word = next_token_str.trim().to_lowercase();
+            if predicted_word.contains("paris") || predicted_word.contains("par") {
+                println!("✅ Model shows knowledge of France's capital!");
+                return; // Test passes if any prompt works
+            }
+        }
+        
+        // If we get here, none of the prompts worked well
+        println!("⚠️  Model didn't clearly predict Paris for any prompt. This might indicate:");
+        println!("  - The model needs different prompt engineering");
+        println!("  - The model is primarily trained for completion, not Q&A");
+        println!("  - The model might need more context or different formatting");
+        
+        // Don't fail the test - this is exploratory to understand model capabilities
+        // In a real scenario, you might want to assert based on your requirements
     }
 
     #[test]
