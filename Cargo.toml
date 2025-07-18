@@ -11,6 +11,11 @@ path = "src/main.rs"
 name = "coreml_test"
 path = "src/coreml_test.rs"
 
+[features]
+default = []
+coreml = []
+ci-tests = []
+
 [dependencies]
 block2 = "0.6.1"
 candle-core = "0.9.1"
