@@ -1,0 +1,23 @@
+[package]
+name = "candle-coreml"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "benchmark"
+path = "src/main.rs"
+
+[[bin]]
+name = "coreml_test"
+path = "src/coreml_test.rs"
+
+[dependencies]
+block2 = "0.6.1"
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+objc2 = "0.6.1"
+objc2-core-ml = "0.3.1"
+objc2-foundation = "0.3.1"
+rand = "0.9.1"
+tokenizers = "0.19.1"

@@ -23,7 +23,9 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 // Test configuration - OpenELM-450M-Instruct model specifications
-const TOKENIZER_PATH: &str = "tokenizer.json";
+const TOKENIZER_PATH: &str = "models/tokenizer.json";
+const MODEL_DIR: &str = "models";
+const MODEL_FILENAME: &str = "OpenELM-450M-Instruct-128-float32.mlmodelc";
 const INPUT_NAME: &str = "input_ids";
 const OUTPUT_NAME: &str = "logits";
 const MAX_SEQUENCE_LENGTH: usize = 128;  // Fixed sequence length
@@ -227,119 +229,25 @@ fn generate_completion(
     device: &Device,
 ) -> Result<String, String> {
     // Apply prompt engineering for better results
-    let engineered_prompt = if prompt.trim().ends_with('?') {
-        // For questions, try to convert to completion format
-        if prompt.to_lowercase().contains("what is") && prompt.to_lowercase().contains("capital") {
-            // Special case for capital questions
-            if let Some(country) = extract_country_from_question(prompt) {
-                format!("The capital of {} is", country)
-            } else {
-                prompt.to_string()
-            }
-        } else if prompt.to_lowercase().contains("tallest mountain") {
-            // Special case for mountain questions
-            "The tallest mountain is".to_string()
-        } else {
-            // For other questions, try completion format
-            format!("{}. The answer is", prompt.trim_end_matches('?'))
-        }
-    } else {
-        prompt.to_string()
-    };
+    let engineered_prompt = prompt_engineering::engineer_prompt(prompt);
     
     // Generate multiple tokens iteratively
     let mut current_text = engineered_prompt.clone();
     let mut generated_tokens = Vec::new();
     let max_new_tokens = 5; // Generate up to 5 additional tokens
     
-    // Pre-allocate feature provider for reuse
-    let mut cached_provider: Option<Retained<MLDictionaryFeatureProvider>> = None;
-    
     for _ in 0..max_new_tokens {
-        // Get current tokens
-        let encoding = tokenizer.encode(current_text.as_str(), true)
-            .map_err(|e| format!("Tokenization failed: {}", e))?;
-        let current_tokens = encoding.get_ids();
-        
-        // Check if we've reached max length
-        if current_tokens.len() >= MAX_SEQUENCE_LENGTH {
-            break;
-        }
-        
-        let actual_len = current_tokens.len().min(MAX_SEQUENCE_LENGTH);
-        
-        // Prepare model input - reuse tensor creation pattern
-        let tensor = prepare_model_input(current_text.as_str(), tokenizer, device)?;
-        let ml_array = tensor_to_mlmultiarray(&tensor)
-            .map_err(|e| format!("Tensor conversion failed: {}", e))?;
-        
-        // Reuse or create feature provider
-        let provider = if cached_provider.is_none() {
-            let new_provider = create_feature_provider(INPUT_NAME, &ml_array)?;
-            cached_provider = Some(new_provider.clone());
-            new_provider
-        } else {
-            // For now, still create new provider since MLMultiArray changes
-            // TODO: Optimize by reusing provider with same shape
-            create_feature_provider(INPUT_NAME, &ml_array)?
-        };
-        
-        // Run prediction
-        let prediction = run_model_prediction(model, &provider)?;
-        
-        // Extract logits
-        let logits = extract_logits(&*prediction, OUTPUT_NAME)?;
-        
-        // Get logits for next token prediction (last non-pad position)
-        let last_pos = actual_len - 1;
-        
-        // Use Candle tensor slicing to avoid Vec allocation
-        let logits_tensor = Tensor::from_vec(logits, (1, MAX_SEQUENCE_LENGTH, VOCAB_SIZE), device)
-            .map_err(|e| format!("Failed to create full logits tensor: {}", e))?;
-        
-        // Slice the tensor to get the last position's logits
-        let last_token_logits = logits_tensor
-            .narrow(1, last_pos, 1).map_err(|e| format!("Narrow failed: {}", e))?
-            .squeeze(1).map_err(|e| format!("Squeeze failed: {}", e))?
-            .squeeze(0).map_err(|e| format!("Squeeze failed: {}", e))?
-            .contiguous().map_err(|e| format!("Contiguous failed: {}", e))?;
-        
-        // Choose sampling strategy based on context
-        let sampling_strategy = if current_text.contains("capital") {
-            // Use ArgMax for factual questions where we want deterministic answers
-            Sampling::ArgMax
-        } else if current_text.contains("tallest mountain") {
-            // Use top-k=3 with low temperature for factual questions
-            Sampling::TopK { k: 3, temperature: 0.3 }
-        } else {
-            // Use top-k=5 with moderate temperature for creative tasks
-            Sampling::TopK { k: 5, temperature: 0.7 }
-        };
-        
-        let mut logits_processor = LogitsProcessor::from_sampling(42, sampling_strategy);
-        
-        // Sample next token
-        let next_token_id = logits_processor.sample(&last_token_logits)
-            .map_err(|e| format!("Failed to sample token: {}", e))?;
-        
-        // Decode next token
-        let next_token_str = tokenizer.decode(&[next_token_id], true)
-            .map_err(|e| format!("Failed to decode token: {}", e))?;
-        
-        let trimmed_token = next_token_str.trim();
-        
-        // Stop if we get an end-of-sequence token or empty token
-        if trimmed_token.is_empty() || next_token_id == 0 {
-            break;
-        }
-        
-        // Add the token to our generated sequence
-        generated_tokens.push(trimmed_token.to_string());
-        current_text = format!("{} {}", current_text, trimmed_token);
-        
-        // Stop if we hit common end-of-sentence patterns
-        if trimmed_token.ends_with('.') || trimmed_token.ends_with('!') || trimmed_token.ends_with('?') {
-            break;
+        match generate_single_token(&current_text, model, tokenizer, device)? {
+            Some(token) => {
+                generated_tokens.push(token.clone());
+                current_text = format!("{} {}", current_text, token);
+                
+                // Stop if we hit end-of-sentence patterns
+                if token.ends_with('.') || token.ends_with('!') || token.ends_with('?') {
+                    break;
+                }
+            }
+            None => break, // No more tokens to generate
         }
     }
     
@@ -351,21 +259,137 @@ fn generate_completion(
     }
 }
 
-/// Extract country name from capital question
-fn extract_country_from_question(question: &str) -> Option<&str> {
-    let lower = question.to_lowercase();
-    if lower.contains("france") {
-        Some("France")
-    } else if lower.contains("germany") {
-        Some("Germany")
-    } else if lower.contains("italy") {
-        Some("Italy")
-    } else if lower.contains("spain") {
-        Some("Spain")
-    } else if lower.contains("england") || lower.contains("uk") || lower.contains("united kingdom") {
-        Some("England")
+/// Generate a single token given current context
+fn generate_single_token(
+    current_text: &str,
+    model: &MLModel,
+    tokenizer: &Tokenizer,
+    device: &Device,
+) -> Result<Option<String>, String> {
+    // Get current tokens
+    let encoding = tokenizer.encode(current_text, true)
+        .map_err(|e| format!("Tokenization failed: {}", e))?;
+    let current_tokens = encoding.get_ids();
+    
+    // Check if we've reached max length
+    if current_tokens.len() >= MAX_SEQUENCE_LENGTH {
+        return Ok(None);
+    }
+    
+    let actual_len = current_tokens.len().min(MAX_SEQUENCE_LENGTH);
+    
+    // Prepare model input - reuse tensor creation pattern
+    let tensor = prepare_model_input(current_text, tokenizer, device)?;
+    let ml_array = tensor_to_mlmultiarray(&tensor)
+        .map_err(|e| format!("Tensor conversion failed: {}", e))?;
+    
+    // Create feature provider
+    let provider = create_feature_provider(INPUT_NAME, &ml_array)?;
+    
+    // Run prediction
+    let prediction = run_model_prediction(model, &provider)?;
+    
+    // Extract logits
+    let logits = extract_logits(&*prediction, OUTPUT_NAME)?;
+    
+    // Get logits for next token prediction (last non-pad position)
+    let last_pos = actual_len - 1;
+    
+    // Use Candle tensor slicing to avoid Vec allocation
+    let logits_tensor = Tensor::from_vec(logits, (1, MAX_SEQUENCE_LENGTH, VOCAB_SIZE), device)
+        .map_err(|e| format!("Failed to create full logits tensor: {}", e))?;
+    
+    // Slice the tensor to get the last position's logits
+    let last_token_logits = logits_tensor
+        .narrow(1, last_pos, 1).map_err(|e| format!("Narrow failed: {}", e))?
+        .squeeze(1).map_err(|e| format!("Squeeze failed: {}", e))?
+        .squeeze(0).map_err(|e| format!("Squeeze failed: {}", e))?
+        .contiguous().map_err(|e| format!("Contiguous failed: {}", e))?;
+    
+    // Sample next token using context-aware strategy
+    let next_token_id = sample_next_token(&last_token_logits, current_text, device)?;
+    
+    // Decode next token
+    let next_token_str = tokenizer.decode(&[next_token_id], true)
+        .map_err(|e| format!("Failed to decode token: {}", e))?;
+    
+    let trimmed_token = next_token_str.trim();
+    
+    // Stop if we get an end-of-sequence token or empty token
+    if trimmed_token.is_empty() || next_token_id == 0 {
+        return Ok(None);
+    }
+    
+    // Stop if we hit common end-of-sentence patterns
+    if trimmed_token.ends_with('.') || trimmed_token.ends_with('!') || trimmed_token.ends_with('?') {
+        return Ok(Some(trimmed_token.to_string()));
+    }
+    
+    Ok(Some(trimmed_token.to_string()))
+}
+
+/// Sample next token using context-aware sampling strategy
+fn sample_next_token(logits: &Tensor, context: &str, _device: &Device) -> Result<u32, String> {
+    // Choose sampling strategy based on context
+    let sampling_strategy = if context.contains("capital") {
+        // Use ArgMax for factual questions where we want deterministic answers
+        Sampling::ArgMax
+    } else if context.contains("tallest mountain") {
+        // Use top-k=3 with low temperature for factual questions
+        Sampling::TopK { k: 3, temperature: 0.3 }
     } else {
-        None
+        // Use top-k=5 with moderate temperature for creative tasks
+        Sampling::TopK { k: 5, temperature: 0.7 }
+    };
+    
+    let mut logits_processor = LogitsProcessor::from_sampling(42, sampling_strategy);
+    
+    // Sample next token
+    logits_processor.sample(logits)
+        .map_err(|e| format!("Failed to sample token: {}", e))
+}
+
+/// Prompt engineering utilities for better model responses
+mod prompt_engineering {
+    /// Extract country name from capital question
+    fn extract_country_from_question(question: &str) -> Option<&str> {
+        let lower = question.to_lowercase();
+        if lower.contains("france") {
+            Some("France")
+        } else if lower.contains("germany") {
+            Some("Germany")
+        } else if lower.contains("italy") {
+            Some("Italy")
+        } else if lower.contains("spain") {
+            Some("Spain")
+        } else if lower.contains("england") || lower.contains("uk") || lower.contains("united kingdom") {
+            Some("England")
+        } else {
+            None
+        }
+    }
+    
+    /// Transform user prompts into formats that work better with the model
+    pub fn engineer_prompt(prompt: &str) -> String {
+        if prompt.trim().ends_with('?') {
+            // For questions, try to convert to completion format
+            if prompt.to_lowercase().contains("what is") && prompt.to_lowercase().contains("capital") {
+                // Special case for capital questions
+                if let Some(country) = extract_country_from_question(prompt) {
+                    format!("The capital of {} is", country)
+                } else {
+                    prompt.to_string()
+                }
+            } else if prompt.to_lowercase().contains("tallest mountain") {
+                // Special case for mountain questions
+                "The tallest mountain is".to_string()
+            } else {
+                // For other questions, try completion format
+                format!("{}. The answer is", prompt.trim_end_matches('?'))
+            }
+        } else {
+            prompt.to_string()
+        }
     }
 }
 
@@ -377,25 +401,25 @@ mod tests {
 
     #[test]
     fn test_model_loading() {
-        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
-        let model = load_model(model_path).expect("Failed to load model");
-        
+        let model_path = Path::new(MODEL_DIR).join(MODEL_FILENAME);
+        let model = load_model(model_path.as_path()).expect("Failed to load model");
+
         let model_description = unsafe { model.modelDescription() };
         let input_descriptions = unsafe { model_description.inputDescriptionsByName() };
         let output_descriptions = unsafe { model_description.outputDescriptionsByName() };
-        
+
         assert_eq!(input_descriptions.count(), 1);
         assert_eq!(output_descriptions.count(), 1);
-        
+
         let input_keys = input_descriptions.allKeys();
         let output_keys = output_descriptions.allKeys();
-        
+
         autoreleasepool(|pool| {
             let input_key = input_keys.objectAtIndex(0);
             let input_name = unsafe { input_key.to_str(pool) };
             assert_eq!(input_name, INPUT_NAME);
         });
-        
+
         autoreleasepool(|pool| {
             let output_key = output_keys.objectAtIndex(0);
             let output_name = unsafe { output_key.to_str(pool) };
@@ -424,19 +448,18 @@ mod tests {
 
     #[test]
     fn test_generate_completion() {
-        let model_path = Path::new("OpenELM-450M-Instruct-128-float32.mlmodelc");
+        let model_path = Path::new(MODEL_DIR).join(MODEL_FILENAME);
         let tokenizer_path = Path::new(TOKENIZER_PATH);
-        
-        let model = load_model(model_path).expect("Failed to load model");
+
+        let model = load_model(model_path.as_path()).expect("Failed to load model");
         let tokenizer = load_tokenizer(tokenizer_path).expect("Failed to load tokenizer");
-        
+
         let device = Device::Cpu;
         let prompt = "The quick brown fox";
-    
-        
+
         let completion = generate_completion(prompt, &model, &tokenizer, &device)
             .expect("Failed to generate completion");
-        
+
         assert!(!completion.is_empty());
         let last_token = completion.split_whitespace().last().unwrap();
         assert!(!last_token.is_empty(), "Last token should not be empty");
@@ -458,11 +481,15 @@ fn main() {
         return;
     }
     
-    let model_path = Path::new(&args[1]);
+    let model_path = if args.len() > 1 {
+        Path::new(MODEL_DIR).join(&args[1])
+    } else {
+        Path::new(MODEL_DIR).join(MODEL_FILENAME)
+    };
     let tokenizer_path = Path::new(TOKENIZER_PATH);
     
     // Load model and tokenizer
-    let model = match load_model(model_path) {
+    let model = match load_model(model_path.as_path()) {
         Ok(model) => {
             println!("✅ Model loaded: {}", model_path.display());
             model
